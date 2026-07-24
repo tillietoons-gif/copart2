@@ -408,10 +408,10 @@ class VehicleParser:
         if not text or not isinstance(text, str):
             return None
         import re
-        match = re.search(r"\d+", text)
+        match = re.search(r"\d[\d,]*", text)
         if match:
             try:
-                return int(match.group(0))
+                return int(match.group(0).replace(",", ""))
             except ValueError:
                 return None
         return None

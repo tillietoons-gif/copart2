@@ -8,7 +8,8 @@ A production-quality Python automation framework for interacting with a personal
 - **Session persistence** via Playwright storage state (reuse login across runs)
 - **Multi-Factor Authentication (MFA) support** — pauses for user verification rather than attempting automatic bypass
 - **Structured data extraction** using BeautifulSoup4 and Pydantic validation
-- **SQLite database** for persistent storage of vehicles, searches, and downloads
+- **Auction CSV export ingestion** via Copart sale-list Export button (`lotsearchExport`) for fast full-auction lot imports
+- **SQLite database** for persistent storage of vehicles, searches, downloads, auction CSV exports, and raw CSV lot rows
 - **Download management** with per-vehicle folder organization
 - **Export support** (CSV, Excel, JSON)
 - **Modular architecture** following SOLID principles and clean code practices
@@ -26,6 +27,8 @@ copart_automation/
 │   ├── session.py       # Session lifecycle and verification
 │   ├── navigation.py    # Reusable page navigation helpers
 │   ├── search.py        # Search module (VIN, lot, make/model, year)
+│   ├── calendar.py      # Auction calendar scraping
+│   ├── auction_export.py # Auction lot CSV export download/parsing
 │   ├── parser.py        # HTML parsing using BeautifulSoup4
 │   ├── downloader.py    # File download management
 │   ├── database.py      # SQLite CRUD and exports
@@ -40,6 +43,7 @@ copart_automation/
 │   ├── test_config.py
 │   ├── test_models.py
 │   ├── test_parser.py
+│   ├── test_auction_export.py
 │   ├── test_database.py
 │   └── test_session.py
 ├── data/                # Database and auth state
@@ -111,9 +115,13 @@ The main workflow:
 1. Initializes a Playwright browser session.
 2. Loads an existing authenticated session (if available) or performs login.
 3. If additional verification (e.g., MFA) is required, pauses for user input.
-4. Navigates to the dashboard and performs an example VIN search.
-5. Parses results, saves to SQLite, and optionally downloads images.
-6. Exports data and closes resources cleanly.
+4. Scrapes the auction calendar and opens each auction's lots page.
+5. Clicks the Copart sale-list **Export** button when available and imports the downloaded lot CSV into SQLite.
+6. Stores both normalized vehicle records and raw CSV rows (`auction_lot_exports` / `auction_lot_rows`) so columns not mapped to the `vehicles` table are still preserved.
+7. Falls back to parsing individual lot pages if the CSV export is unavailable or incomplete.
+8. Navigates to the dashboard and performs an example VIN search.
+9. Parses results, saves to SQLite, and optionally downloads images.
+10. Exports data and closes resources cleanly.
 
 ### Running with Custom Search
 

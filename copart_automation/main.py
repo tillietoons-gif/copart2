@@ -24,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from copart_automation.app.auction_export import AuctionExportManager
 from copart_automation.app.auth import AuthManager
 from copart_automation.app.browser import BrowserManager
 from copart_automation.app.config import settings
@@ -34,6 +35,7 @@ from copart_automation.app.navigation import NavigationHelper
 from copart_automation.app.search import SearchModule
 from copart_automation.app.session import SessionManager
 from copart_automation.app.calendar import AuctionCalendarParser
+from copart_automation.app.models import AuctionCalendarEntry
 from copart_automation.app.parser import VehicleParser
 
 logger = get_logger(__name__)
@@ -67,6 +69,7 @@ async def run_automation_workflow() -> int:
             download_manager = DownloadManager(session_manager.browser)
             db = DatabaseModule()
             auction_parser = AuctionCalendarParser()
+            auction_export_manager = AuctionExportManager()
             vehicle_parser = VehicleParser()
 
             # Scrape the auction calendar immediately after login
@@ -106,6 +109,65 @@ async def run_automation_workflow() -> int:
                         logger.info("Opening lots view for auction: {} -> {}", auction.description, auction.lots_view_url)
                         lots_page = await navigation.navigate_to_page(auction.lots_view_url, timeout=settings.navigation_timeout)
                         try:
+                            # Fast path: Copart sale-list pages include an Export button
+                            # (id="exportButton", data-uname="lotsearchExport") that downloads
+                            # a CSV containing all lots in the auction.  Prefer this over visiting
+                            # every lot detail page individually.
+                            csv_path = await auction_export_manager.download_lots_csv(
+                                lots_page,
+                                timeout=settings.navigation_timeout,
+                            )
+                            if csv_path:
+                                auction_url = str(auction.lots_view_url)
+                                auction_id = db.get_auction_id_by_lots_url(auction_url)
+                                csv_rows = auction_export_manager.read_csv_rows(csv_path)
+                                csv_vehicles = auction_export_manager.parse_csv_file(
+                                    csv_path,
+                                    source_url=auction_url,
+                                )
+                                export_id = db.insert_auction_lot_export(
+                                    source_url=auction_url,
+                                    csv_file_path=csv_path,
+                                    row_count=len(csv_rows),
+                                    imported_vehicle_count=len(csv_vehicles),
+                                )
+                                if export_id:
+                                    for row in csv_rows:
+                                        lot_number, vin = auction_export_manager.extract_row_identifiers(row)
+                                        db.insert_auction_lot_row(
+                                            export_id,
+                                            row,
+                                            lot_number=lot_number,
+                                            vin=vin,
+                                            auction_id=auction_id,
+                                        )
+                                elif csv_rows:
+                                    logger.warning(
+                                        "Could not record CSV export metadata for {}; raw rows not stored.",
+                                        csv_path,
+                                    )
+                                if csv_vehicles:
+                                    for vehicle in csv_vehicles:
+                                        db.insert_vehicle(
+                                            vehicle,
+                                            auction_id=auction_id,
+                                            source_auction_url=auction_url,
+                                            source_csv_path=csv_path,
+                                        )
+                                    logger.info(
+                                        "Imported {} lots for auction {} from CSV export {}",
+                                        len(csv_vehicles),
+                                        auction.description,
+                                        csv_path,
+                                    )
+                                    continue
+                                logger.info(
+                                    "CSV export {} did not yield complete vehicle rows; falling back to lot pages.",
+                                    csv_path,
+                                )
+                            else:
+                                logger.info("CSV export unavailable; falling back to lot page parsing.")
+
                             lot_urls = await vehicle_parser.parse_lots_list(lots_page)
                             logger.info("Found {} lots for auction {}", len(lot_urls), auction.description)
                             # Visit each lot URL and parse details concurrently (bounded)

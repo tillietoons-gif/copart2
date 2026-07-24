@@ -29,6 +29,7 @@ class TestParserHelpers:
     def test_clean_int_valid(self) -> None:
         assert VehicleParser._clean_int("2020") == 2020
         assert VehicleParser._clean_int("Mileage: 45000 miles") == 45000
+        assert VehicleParser._clean_int("Odometer: 12,345 mi") == 12345
 
     def test_clean_float_valid(self) -> None:
         assert VehicleParser._clean_float("$2,500.00") == 2500.0
