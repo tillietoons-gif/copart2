@@ -12,6 +12,8 @@ Design decisions:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -41,140 +43,226 @@ class DatabaseModule:
         self._init_schema()
 
     def _init_schema(self) -> None:
-        """Initialize database schema from SQL file if not present."""
+        """Initialize database schema and run lightweight migrations."""
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.execute("PRAGMA foreign_keys = ON;")
             if SCHEMA_PATH.exists():
                 schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
                 conn.executescript(schema_sql)
-                conn.commit()
-            # Ensure lot scrape status table exists for tracking
-            try:
-                if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='lot_scrape_status'").fetchone():
-                    conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS lot_scrape_status (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            auction_id INTEGER,
-                            lot_url TEXT NOT NULL UNIQUE,
-                            status TEXT NOT NULL DEFAULT 'pending',
-                            attempts INTEGER NOT NULL DEFAULT 0,
-                            last_error TEXT,
-                            last_attempt_at TIMESTAMP,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (auction_id) REFERENCES auction_calendar(id) ON DELETE SET NULL
-                        )
-                        """
-                    )
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_lot_scrape_status_auction ON lot_scrape_status(auction_id)")
-                    conn.commit()
-            except Exception:
-                # Non-fatal: continue even if table creation fails (older DBs remain usable)
-                pass
             else:
-                # Minimal fallback schema creation
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS vehicles (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        vin TEXT NOT NULL,
-                        lot_number TEXT NOT NULL UNIQUE,
-                        title_text TEXT,
-                        year INTEGER,
-                        make TEXT,
-                        model TEXT,
-                        odometer INTEGER,
-                        damage_description TEXT,
-                        sale_date TEXT,
-                        current_bid REAL,
-                        auction_status TEXT,
-                        detail_url TEXT,
-                        image_urls TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(vin, lot_number)
-                    )
-                """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_vehicles_vin ON vehicles(vin)")
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS searches (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        query_type TEXT NOT NULL,
-                        query_value TEXT NOT NULL,
-                        result_count INTEGER DEFAULT 0,
-                        executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS downloads (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        vehicle_id INTEGER NOT NULL,
-                        file_path TEXT NOT NULL,
-                        file_type TEXT,
-                        download_url TEXT,
-                        downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        file_size_bytes INTEGER,
-                        FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE,
-                        UNIQUE(vehicle_id, file_path)
-                    )
-                """)
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS auction_calendar (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        event_date TEXT NOT NULL,
-                        auction_time TEXT,
-                        description TEXT,
-                        table_section TEXT,
-                        row_index INTEGER,
-                        column_index INTEGER,
-                        lots_view_url TEXT,
-                        lots_view_text TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(event_date, auction_time, description)
-                    )
-                """)
-                conn.commit()
+                logger.warning("Schema file {} not found; creating fallback schema.", SCHEMA_PATH)
+                self._create_fallback_schema(conn)
 
-            # Migration: ensure new columns exist for existing DBs
-            try:
-                cols = [row[1] for row in conn.execute("PRAGMA table_info(auction_calendar)").fetchall()]
-                if "lots_view_url" not in cols:
-                    conn.execute("ALTER TABLE auction_calendar ADD COLUMN lots_view_url TEXT")
-                    logger.info("Migrated auction_calendar: added lots_view_url")
-                if "lots_view_text" not in cols:
-                    conn.execute("ALTER TABLE auction_calendar ADD COLUMN lots_view_text TEXT")
-                    logger.info("Migrated auction_calendar: added lots_view_text")
-                conn.commit()
-                # Ensure index for new column
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_auction_calendar_lots_url ON auction_calendar(lots_view_url)")
-                conn.commit()
-            except Exception as exc:
-                logger.warning(f"Auction calendar migration check failed: {exc}")
-
+            self._run_migrations(conn)
+            conn.commit()
             logger.info("Database schema initialized at {}", self.db_path)
         finally:
             conn.close()
 
-        # Post-migration: remove duplicate auction_calendar rows keeping one with lots_view_url when available
+        self._cleanup_duplicate_calendar_rows()
+
+    @staticmethod
+    def _create_fallback_schema(conn: sqlite3.Connection) -> None:
+        """Create a minimal schema if sql/schema.sql is unavailable."""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS auction_calendar (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_date TEXT NOT NULL,
+                auction_time TEXT,
+                description TEXT,
+                table_section TEXT,
+                row_index INTEGER,
+                column_index INTEGER,
+                lots_view_url TEXT,
+                lots_view_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(event_date, auction_time, description)
+            );
+
+            CREATE TABLE IF NOT EXISTS vehicles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vin TEXT NOT NULL,
+                lot_number TEXT NOT NULL UNIQUE,
+                title_text TEXT,
+                year INTEGER,
+                make TEXT,
+                model TEXT,
+                odometer INTEGER,
+                damage_description TEXT,
+                sale_date TEXT,
+                current_bid REAL,
+                auction_status TEXT,
+                detail_url TEXT,
+                image_urls TEXT,
+                auction_calendar_id INTEGER,
+                source_auction_url TEXT,
+                source_csv_path TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (auction_calendar_id) REFERENCES auction_calendar(id) ON DELETE SET NULL,
+                UNIQUE(vin, lot_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_type TEXT NOT NULL,
+                query_value TEXT NOT NULL,
+                result_count INTEGER DEFAULT 0,
+                executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vehicle_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT,
+                download_url TEXT,
+                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                file_size_bytes INTEGER,
+                FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE,
+                UNIQUE(vehicle_id, file_path)
+            );
+            """
+        )
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Bring existing SQLite databases up to the current schema."""
+        self._ensure_auction_calendar_columns(conn)
+        self._ensure_vehicle_source_columns(conn)
+        self._ensure_csv_export_schema(conn)
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+    def _ensure_auction_calendar_columns(self, conn: sqlite3.Connection) -> None:
+        try:
+            cols = self._table_columns(conn, "auction_calendar")
+            if "lots_view_url" not in cols:
+                conn.execute("ALTER TABLE auction_calendar ADD COLUMN lots_view_url TEXT")
+                logger.info("Migrated auction_calendar: added lots_view_url")
+            if "lots_view_text" not in cols:
+                conn.execute("ALTER TABLE auction_calendar ADD COLUMN lots_view_text TEXT")
+                logger.info("Migrated auction_calendar: added lots_view_text")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_auction_calendar_lots_url "
+                "ON auction_calendar(lots_view_url)"
+            )
+        except Exception as exc:
+            logger.warning(f"Auction calendar migration check failed: {exc}")
+
+    def _ensure_vehicle_source_columns(self, conn: sqlite3.Connection) -> None:
+        try:
+            cols = self._table_columns(conn, "vehicles")
+            migrations = {
+                "auction_calendar_id": (
+                    "ALTER TABLE vehicles ADD COLUMN auction_calendar_id INTEGER "
+                    "REFERENCES auction_calendar(id) ON DELETE SET NULL"
+                ),
+                "source_auction_url": "ALTER TABLE vehicles ADD COLUMN source_auction_url TEXT",
+                "source_csv_path": "ALTER TABLE vehicles ADD COLUMN source_csv_path TEXT",
+            }
+            for column_name, ddl in migrations.items():
+                if column_name not in cols:
+                    conn.execute(ddl)
+                    logger.info("Migrated vehicles: added {}", column_name)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vehicles_auction_calendar "
+                "ON vehicles(auction_calendar_id)"
+            )
+        except Exception as exc:
+            logger.warning(f"Vehicle source migration check failed: {exc}")
+
+    @staticmethod
+    def _ensure_csv_export_schema(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS auction_lot_exports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                auction_id INTEGER,
+                source_url TEXT NOT NULL,
+                csv_file_path TEXT NOT NULL,
+                row_count INTEGER NOT NULL DEFAULT 0,
+                imported_vehicle_count INTEGER NOT NULL DEFAULT 0,
+                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (auction_id) REFERENCES auction_calendar(id) ON DELETE SET NULL,
+                UNIQUE(source_url, csv_file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_auction_lot_exports_auction
+                ON auction_lot_exports(auction_id);
+            CREATE INDEX IF NOT EXISTS idx_auction_lot_exports_source_url
+                ON auction_lot_exports(source_url);
+
+            CREATE TABLE IF NOT EXISTS auction_lot_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                export_id INTEGER NOT NULL,
+                auction_id INTEGER,
+                lot_number TEXT,
+                vin TEXT,
+                row_json TEXT NOT NULL,
+                row_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (export_id) REFERENCES auction_lot_exports(id) ON DELETE CASCADE,
+                FOREIGN KEY (auction_id) REFERENCES auction_calendar(id) ON DELETE SET NULL,
+                UNIQUE(export_id, row_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_auction_lot_rows_export
+                ON auction_lot_rows(export_id);
+            CREATE INDEX IF NOT EXISTS idx_auction_lot_rows_auction
+                ON auction_lot_rows(auction_id);
+            CREATE INDEX IF NOT EXISTS idx_auction_lot_rows_lot
+                ON auction_lot_rows(lot_number);
+            CREATE INDEX IF NOT EXISTS idx_auction_lot_rows_vin
+                ON auction_lot_rows(vin);
+
+            CREATE TABLE IF NOT EXISTS lot_scrape_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                auction_id INTEGER,
+                lot_url TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (auction_id) REFERENCES auction_calendar(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lot_scrape_status_auction
+                ON lot_scrape_status(auction_id);
+            CREATE INDEX IF NOT EXISTS idx_lot_scrape_status_status
+                ON lot_scrape_status(status);
+            """
+        )
+
+    def _cleanup_duplicate_calendar_rows(self) -> None:
+        """Remove duplicate calendar rows, preferring rows with lots_view_url."""
         try:
             conn = sqlite3.connect(str(self.db_path))
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT id, event_date, COALESCE(auction_time,'') as auction_time, COALESCE(description,'') as description, lots_view_url FROM auction_calendar ORDER BY id").fetchall()
+            rows = conn.execute(
+                "SELECT id, event_date, COALESCE(auction_time,'') as auction_time, "
+                "COALESCE(description,'') as description, lots_view_url "
+                "FROM auction_calendar ORDER BY id"
+            ).fetchall()
             seen: dict[tuple[str, str, str], int] = {}
             to_delete: list[int] = []
             for row in rows:
                 key = (row["event_date"], row["auction_time"], row["description"].lower())
                 if key in seen:
-                    # prefer to keep the existing record if it has lots_view_url; otherwise replace
                     existing_id = seen[key]
-                    existing_row = conn.execute("SELECT lots_view_url FROM auction_calendar WHERE id = ?", (existing_id,)).fetchone()
+                    existing_row = conn.execute(
+                        "SELECT lots_view_url FROM auction_calendar WHERE id = ?",
+                        (existing_id,),
+                    ).fetchone()
                     if (existing_row and existing_row[0]) or (row["lots_view_url"] is None):
-                        # keep existing, delete current
                         to_delete.append(row["id"])
                     else:
-                        # delete existing, keep current
                         to_delete.append(existing_id)
                         seen[key] = row["id"]
                 else:
@@ -191,11 +279,20 @@ class DatabaseModule:
             except Exception:
                 pass
 
-    def insert_vehicle(self, vehicle: Vehicle) -> int:
+    def insert_vehicle(
+        self,
+        vehicle: Vehicle,
+        auction_id: int | None = None,
+        source_auction_url: str | None = None,
+        source_csv_path: str | Path | None = None,
+    ) -> int:
         """Insert or update a vehicle, avoiding duplicates.
 
         Args:
             vehicle: The Vehicle instance to persist.
+            auction_id: Optional ``auction_calendar.id`` for source tracing.
+            source_auction_url: Optional lots-view/sale-list URL that produced the row.
+            source_csv_path: Optional CSV path when imported through the export button.
 
         Returns:
             The database ID of the inserted or existing record.
@@ -204,20 +301,26 @@ class DatabaseModule:
         try:
             conn.execute("PRAGMA foreign_keys = ON;")
             data = vehicle.to_database_dict()
-            # Remove id if present; SQLite will generate it
             data.pop("id", None)
-            # Try insert; catch unique constraint violation and return existing
+            data["auction_calendar_id"] = auction_id
+            data["source_auction_url"] = str(source_auction_url) if source_auction_url else None
+            data["source_csv_path"] = str(source_csv_path) if source_csv_path else None
+
             try:
                 cursor = conn.execute(
                     """
                     INSERT INTO vehicles (
                         vin, lot_number, title_text, year, make, model,
                         odometer, damage_description, sale_date, current_bid,
-                        auction_status, detail_url, image_urls, created_at, updated_at
+                        auction_status, detail_url, image_urls,
+                        auction_calendar_id, source_auction_url, source_csv_path,
+                        created_at, updated_at
                     ) VALUES (
                         :vin, :lot_number, :title_text, :year, :make, :model,
                         :odometer, :damage_description, :sale_date, :current_bid,
-                        :auction_status, :detail_url, :image_urls, :created_at, :updated_at
+                        :auction_status, :detail_url, :image_urls,
+                        :auction_calendar_id, :source_auction_url, :source_csv_path,
+                        :created_at, :updated_at
                     )
                     """,
                     data,
@@ -227,19 +330,60 @@ class DatabaseModule:
                 logger.info("Inserted vehicle {} (id={})", vehicle.lot_number, vehicle_id)
                 return vehicle_id or 0
             except sqlite3.IntegrityError:
-                # Duplicate: retrieve existing ID
+                # Duplicate: retrieve existing ID.  The schema has both
+                # UNIQUE(lot_number) and UNIQUE(vin, lot_number), so a reused
+                # lot number can conflict even when the VIN representation has
+                # changed (for example, masked vs. full VIN from different
+                # Copart views).
                 row = conn.execute(
-                    "SELECT id FROM vehicles WHERE vin = ? AND lot_number = ?",
-                    (vehicle.vin, vehicle.lot_number),
+                    "SELECT id FROM vehicles "
+                    "WHERE lot_number = ? OR (vin = ? AND lot_number = ?) LIMIT 1",
+                    (vehicle.lot_number, vehicle.vin, vehicle.lot_number),
                 ).fetchone()
                 conn.rollback()
                 if row:
-                    logger.info("Vehicle {} already exists (id={}); skipped insert.", vehicle.lot_number, row[0])
-                    return row[0]
-                else:
-                    raise CopartAutomationError("Duplicate key conflict but existing record not found.")
+                    vehicle_id = int(row[0])
+                    self._update_vehicle_source(
+                        conn,
+                        vehicle_id,
+                        auction_id=auction_id,
+                        source_auction_url=source_auction_url,
+                        source_csv_path=source_csv_path,
+                    )
+                    conn.commit()
+                    logger.info("Vehicle {} already exists (id={}); skipped insert.", vehicle.lot_number, vehicle_id)
+                    return vehicle_id
+                raise CopartAutomationError("Duplicate key conflict but existing record not found.")
         finally:
             conn.close()
+
+    @staticmethod
+    def _update_vehicle_source(
+        conn: sqlite3.Connection,
+        vehicle_id: int,
+        auction_id: int | None = None,
+        source_auction_url: str | None = None,
+        source_csv_path: str | Path | None = None,
+    ) -> None:
+        """Backfill source metadata on an existing vehicle row."""
+        if auction_id is None and source_auction_url is None and source_csv_path is None:
+            return
+        conn.execute(
+            """
+            UPDATE vehicles
+            SET auction_calendar_id = COALESCE(auction_calendar_id, ?),
+                source_auction_url = COALESCE(source_auction_url, ?),
+                source_csv_path = COALESCE(source_csv_path, ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                auction_id,
+                str(source_auction_url) if source_auction_url else None,
+                str(source_csv_path) if source_csv_path else None,
+                vehicle_id,
+            ),
+        )
 
     def get_vehicle_by_lot(self, lot_number: str) -> Vehicle | None:
         conn = sqlite3.connect(str(self.db_path))
@@ -352,8 +496,124 @@ class DatabaseModule:
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT * FROM auction_calendar WHERE COALESCE(lots_view_url,'') != '' ORDER BY event_date").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM auction_calendar "
+                "WHERE COALESCE(lots_view_url,'') != '' ORDER BY event_date"
+            ).fetchall()
             return [AuctionCalendarEntry.from_database_row(dict(row)) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _resolve_auction_id(
+        conn: sqlite3.Connection,
+        auction_lots_view_url: str | None,
+    ) -> int | None:
+        if not auction_lots_view_url:
+            return None
+        row = conn.execute(
+            "SELECT id FROM auction_calendar WHERE COALESCE(lots_view_url,'') = ? LIMIT 1",
+            (str(auction_lots_view_url),),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def get_auction_id_by_lots_url(self, auction_lots_view_url: str | None) -> int | None:
+        """Resolve an auction_calendar id by its lots-view URL."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            return self._resolve_auction_id(conn, auction_lots_view_url)
+        finally:
+            conn.close()
+
+    def insert_auction_lot_export(
+        self,
+        source_url: str,
+        csv_file_path: str | Path,
+        row_count: int = 0,
+        imported_vehicle_count: int = 0,
+    ) -> int:
+        """Record a downloaded Copart auction lot CSV export.
+
+        Returns the export row id, updating counts if the same source/path was
+        already recorded.
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            source_url_str = str(source_url)
+            csv_file_path_str = str(csv_file_path)
+            auction_id = self._resolve_auction_id(conn, source_url_str)
+            conn.execute(
+                """
+                INSERT INTO auction_lot_exports (
+                    auction_id, source_url, csv_file_path, row_count,
+                    imported_vehicle_count, downloaded_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(source_url, csv_file_path) DO UPDATE SET
+                    auction_id = COALESCE(excluded.auction_id, auction_lot_exports.auction_id),
+                    row_count = excluded.row_count,
+                    imported_vehicle_count = excluded.imported_vehicle_count,
+                    downloaded_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    auction_id,
+                    source_url_str,
+                    csv_file_path_str,
+                    max(row_count, 0),
+                    max(imported_vehicle_count, 0),
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT id FROM auction_lot_exports WHERE source_url = ? AND csv_file_path = ?",
+                (source_url_str, csv_file_path_str),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def insert_auction_lot_row(
+        self,
+        export_id: int,
+        row_data: dict[str, Any],
+        lot_number: str | None = None,
+        vin: str | None = None,
+        auction_id: int | None = None,
+    ) -> int:
+        """Persist a raw CSV row from a Copart auction lot export."""
+        row_json = json.dumps(row_data, ensure_ascii=False, sort_keys=True, default=str)
+        row_hash = hashlib.sha256(row_json.encode("utf-8")).hexdigest()
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            if auction_id is None:
+                auction_row = conn.execute(
+                    "SELECT auction_id FROM auction_lot_exports WHERE id = ?",
+                    (export_id,),
+                ).fetchone()
+                auction_id = int(auction_row[0]) if auction_row and auction_row[0] else None
+            conn.execute(
+                """
+                INSERT INTO auction_lot_rows (
+                    export_id, auction_id, lot_number, vin, row_json, row_hash,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(export_id, row_hash) DO UPDATE SET
+                    auction_id = COALESCE(excluded.auction_id, auction_lot_rows.auction_id),
+                    lot_number = COALESCE(excluded.lot_number, auction_lot_rows.lot_number),
+                    vin = COALESCE(excluded.vin, auction_lot_rows.vin),
+                    row_json = excluded.row_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (export_id, auction_id, lot_number, vin, row_json, row_hash),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT id FROM auction_lot_rows WHERE export_id = ? AND row_hash = ?",
+                (export_id, row_hash),
+            ).fetchone()
+            return int(row[0]) if row else 0
         finally:
             conn.close()
 
@@ -365,19 +625,15 @@ class DatabaseModule:
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.execute("PRAGMA foreign_keys = ON;")
-            # Try to find auction id by lots_view_url
-            auction_id = None
-            if auction_lots_view_url:
-                row = conn.execute(
-                    "SELECT id FROM auction_calendar WHERE COALESCE(lots_view_url,'') = ? LIMIT 1",
-                    (str(auction_lots_view_url),),
-                ).fetchone()
-                if row:
-                    auction_id = row[0]
+            auction_id = self._resolve_auction_id(conn, auction_lots_view_url)
 
             try:
-                cursor = conn.execute(
-                    "INSERT OR IGNORE INTO lot_scrape_status (auction_id, lot_url, status, attempts, created_at, updated_at) VALUES (?, ?, 'pending', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO lot_scrape_status (
+                        auction_id, lot_url, status, attempts, created_at, updated_at
+                    ) VALUES (?, ?, 'pending', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
                     (auction_id, lot_url),
                 )
                 conn.commit()
@@ -450,8 +706,6 @@ class DatabaseModule:
             conn.close()
 
     def export_to_json(self, output_path: Path) -> Path:
-        import json
-
         conn = sqlite3.connect(str(self.db_path))
         try:
             conn.row_factory = sqlite3.Row
