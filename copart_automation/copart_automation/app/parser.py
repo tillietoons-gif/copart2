@@ -58,11 +58,15 @@ class VehicleParser:
         vehicles: list[Vehicle] = []
         # Common container selectors for result cards
         result_containers = soup.select(
-            ".search-result, .vehicle-card, .lot-item, .listing, [data-testid*='vehicle']"
+            ".search-result, .vehicle-card, .lot-item, .listing, [data-testid*='vehicle'], "
+            ".p-datatable-tbody tr[data-lotnumber], tr[data-lotnumber], .p-selectable-row[data-lotnumber], "
+            ".search_result_lot_detail_block"
         )
         if not result_containers:
             # Fallback: look for any table rows with lot numbers
-            result_containers = soup.select("tr[data-lot], .results-row, .search-row")
+            result_containers = soup.select(
+                "tr[data-lot], tr[data-lotnumber], .results-row, .search-row, .p-datatable-tbody tr"
+            )
 
         for container in result_containers:
             try:
@@ -105,18 +109,29 @@ class VehicleParser:
         # Extract VIN (look for text patterns or specific selectors)
         vin_text = self._find_text(container, [
             ".vin-label", ".vehicle-vin", "[data-field='vin']", "td[data-label='VIN']",
+            ".search_result_vehicle_info_vin", "[class*='vin' i]", "[data-uname*='vin' i]",
         ])
         vin = self._clean_vin(vin_text)
+        if not vin:
+            # Try extracting VIN-like token from the full row text.
+            row_text = container.get_text(" ", strip=True)
+            vin = self._clean_vin(row_text)
 
         # Extract lot number
         lot_text = self._find_text(container, [
             ".lot-number", ".lot-label", "[data-field='lot']", "a[href*='lot/']",
+            ".search_result_lot_number", ".lot-number-row", "[data-lotnumber]",
         ])
         lot_number = self._clean_lot(lot_text)
+        if not lot_number:
+            lot_attr = container.get("data-lotnumber") if hasattr(container, "get") else None
+            if isinstance(lot_attr, str) and lot_attr.strip():
+                lot_number = lot_attr.strip()
 
         # Extract title
         title_text = self._find_text(container, [
             ".title-status", ".vehicle-title", "[data-field='title']",
+            ".search_result_lot_detail", ".search_result_lot_detail_block",
         ])
 
         # Extract year, make, model
@@ -124,6 +139,8 @@ class VehicleParser:
             ".year", ".model-year", "[data-field='year']",
         ])
         year = self._clean_int(year_text)
+        if year is None and title_text:
+            year = self._clean_int(title_text)
 
         make_text = self._find_text(container, [
             ".make", "[data-field='make']",
@@ -173,9 +190,13 @@ class VehicleParser:
                 image_urls.append(src)
 
         if not vin or not lot_number:
-            # If core identifiers are missing, do not create a partial record
-            logger.debug("Skipping container: missing VIN or lot number.")
-            return None
+            # For sale-list pages, VIN is sometimes not rendered until lot detail
+            # page load. Keep the record using a stable synthetic VIN keyed by lot.
+            if lot_number and not vin:
+                vin = f"UNKNOWN-{lot_number}"
+            else:
+                logger.debug("Skipping container: missing VIN or lot number.")
+                return None
 
         return Vehicle(
             vin=vin,

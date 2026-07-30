@@ -233,12 +233,33 @@ class DatabaseModule:
         finally:
             conn.close()
 
-    def insert_auction_calendar_entry(self, entry: 'AuctionCalendarEntry') -> int:
+    def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return conn
+
+    def insert_auction_calendar_entry(self, entry: 'AuctionCalendarEntry') -> int:
+        conn = self._connect()
         try:
             data = entry.to_database_dict()
-            # Ensure updated_at is now for upsert
-            # Use INSERT ... ON CONFLICT to update lot view url when duplicate found
+            normalized_event_date = data["event_date"].strip()
+            normalized_time = (data.get("auction_time") or "").strip().lower()
+            normalized_description = (data.get("description") or "").strip().lower()
+
+            existing = conn.execute(
+                """
+                SELECT id FROM auction_calendar
+                WHERE event_date = ?
+                  AND LOWER(COALESCE(auction_time, '')) = ?
+                  AND LOWER(COALESCE(description, '')) = ?
+                """,
+                (normalized_event_date, normalized_time, normalized_description),
+            ).fetchone()
+            if existing:
+                row_id = existing[0]
+                logger.info("Auction calendar entry already exists (id={}); skipped insert.", row_id)
+                return row_id
+
             cursor = conn.execute(
                 """
                 INSERT INTO auction_calendar (
@@ -246,16 +267,9 @@ class DatabaseModule:
                     row_index, column_index, lots_view_url, lots_view_text,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(event_date, auction_time, description) DO UPDATE SET
-                    table_section = COALESCE(excluded.table_section, auction_calendar.table_section),
-                    row_index = COALESCE(excluded.row_index, auction_calendar.row_index),
-                    column_index = COALESCE(excluded.column_index, auction_calendar.column_index),
-                    lots_view_url = COALESCE(excluded.lots_view_url, auction_calendar.lots_view_url),
-                    lots_view_text = COALESCE(excluded.lots_view_text, auction_calendar.lots_view_text),
-                    updated_at = excluded.updated_at
                 """,
                 (
-                    data["event_date"],
+                    normalized_event_date,
                     data.get("auction_time"),
                     data.get("description"),
                     data.get("table_section"),
@@ -268,15 +282,7 @@ class DatabaseModule:
                 ),
             )
             conn.commit()
-            # If insert resulted in conflict, lastrowid may be 0; try to fetch id
-            if cursor.lastrowid and cursor.lastrowid != 0:
-                return cursor.lastrowid
-            # Fetch existing id for the conflicted row
-            row = conn.execute(
-                "SELECT id FROM auction_calendar WHERE event_date = ? AND COALESCE(auction_time,'') = COALESCE(?, '') AND COALESCE(description,'') = COALESCE(?, '')",
-                (data["event_date"], data.get("auction_time"), data.get("description")),
-            ).fetchone()
-            return row[0] if row else 0
+            return cursor.lastrowid or 0
         finally:
             conn.close()
 

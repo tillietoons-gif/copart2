@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # Browser configuration
     headless: bool = Field(default=True, description="Run browser in headless mode")
     browser_channel: str = Field(default="chromium", description="Playwright browser channel")
+    perform_search: bool = Field(default=False, description="Perform the demo search step in the workflow")
 
     # File paths
     download_dir: Path = Field(default=Path("downloads"), description="Download directory")

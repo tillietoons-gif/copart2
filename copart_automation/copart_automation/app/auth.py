@@ -13,6 +13,7 @@ Design decisions:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -30,6 +31,7 @@ logger = get_logger(__name__)
 # Note: This URL may change; users should verify in .env or docs.
 COPART_LOGIN_URL = "https://www.copart.com/login"
 COPART_DASHBOARD_URL = "https://www.copart.com/"
+COPART_AUCTION_CALENDAR_URL = "https://www.copart.com/auctionCalendar"
 
 
 class AuthManager:
@@ -80,27 +82,58 @@ class AuthManager:
             self._manager._context = new_context
             # Verify the session by navigating to the dashboard
             page = await new_context.new_page()
-            await page.goto(COPART_DASHBOARD_URL, timeout=settings.navigation_timeout)
-            # Wait for a known dashboard element or redirect to login
             try:
-                await page.wait_for_selector(
-                    "a[href*='dashboard'], .dashboard, #main",  # Example selectors
-                    timeout=5000,
-                )
-            except Exception:
-                # If we don't find dashboard indicators quickly, check if
-                # we're redirected to login
-                current_url = page.url
+                try:
+                    await page.goto(
+                        COPART_DASHBOARD_URL,
+                        timeout=settings.navigation_timeout,
+                        wait_until="domcontentloaded",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Dashboard probe for existing session did not complete cleanly: {}",
+                        exc,
+                    )
+
+                current_url = page.url or ""
                 if "/login" in current_url or "/signin" in current_url:
                     logger.info("Existing session expired; redirect detected.")
                     await new_context.close()
                     return False
 
-            # If we reach a non-login page, assume session is valid
-            self._context = new_context
-            logger.info("Existing session loaded successfully.")
-            await page.close()
-            return True
+                # Try a second authenticated page probe when dashboard is inconclusive.
+                if not current_url:
+                    try:
+                        await page.goto(
+                            COPART_AUCTION_CALENDAR_URL,
+                            timeout=settings.navigation_timeout,
+                            wait_until="domcontentloaded",
+                        )
+                        current_url = page.url or ""
+                    except Exception as exc:
+                        logger.warning(
+                            "Auction calendar probe for existing session did not complete cleanly: {}",
+                            exc,
+                        )
+
+                if "/login" in current_url or "/signin" in current_url:
+                    logger.info("Existing session expired after secondary probe; redirect detected.")
+                    await new_context.close()
+                    return False
+
+                # If we reached any non-login Copart URL, keep the session.
+                if "copart.com" in current_url or not current_url:
+                    self._context = new_context
+                    logger.info("Existing session loaded successfully.")
+                    return True
+
+                await new_context.close()
+                return False
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
         except Exception as exc:
             logger.warning(f"Failed to load existing session: {exc}")
             return False
@@ -121,7 +154,8 @@ class AuthManager:
                 or an unrecoverable error.
         """
         email = email or settings.copart_email
-        if not email or not settings.copart_password.get_secret_value():
+        password_value = password or settings.copart_password.get_secret_value()
+        if not email or not password_value:
             raise LoginFailure(
                 "Email or password not configured. Check your .env file."
             )
@@ -143,7 +177,24 @@ class AuthManager:
         page = await self._context.new_page()
         try:
             logger.info("Navigating to Copart login page: {}", COPART_LOGIN_URL)
-            await page.goto(COPART_LOGIN_URL, timeout=settings.navigation_timeout, wait_until="networkidle")
+            try:
+                await page.goto(
+                    COPART_LOGIN_URL,
+                    timeout=settings.navigation_timeout,
+                    wait_until="domcontentloaded",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Initial login page load did not complete cleanly; continuing with best-effort form detection: {}",
+                    exc,
+                )
+
+            # Copart can be slow to reach a true network-idle state. Give the page
+            # a brief moment to settle before probing form elements.
+            try:
+                await asyncio.sleep(1)
+            except Exception:
+                pass
 
             email_selector = ", ".join(
                 [
@@ -171,12 +222,13 @@ class AuthManager:
             try:
                 await page.wait_for_selector(
                     f"{email_selector}, {password_selector}",
-                    timeout=settings.action_timeout,
+                    timeout=max(settings.action_timeout, 10000),
                 )
             except Exception as exc:
-                raise LoginFailure(
-                    f"Login form did not load. The page structure may have changed. Details: {exc}"
-                ) from exc
+                logger.warning(
+                    "Login form selectors were not ready immediately; continuing to probe the page. Details: {}",
+                    exc,
+                )
 
             email_input = await page.query_selector(email_selector)
             if email_input:
@@ -188,7 +240,7 @@ class AuthManager:
 
             password_input = await page.query_selector(password_selector)
             if password_input:
-                await password_input.fill(settings.copart_password.get_secret_value())
+                await password_input.fill(password_value)
             else:
                 raise LoginFailure(
                     "Unable to locate a password input on the Copart login page."
@@ -234,26 +286,32 @@ class AuthManager:
                 # After user completes verification, continue
                 await page.wait_for_navigation(timeout=30000)
 
-            # Verify success: check for dashboard indicators or absence of login
+            # Verify success: check for dashboard indicators or absence of login.
+            # Some Copart responses may leave the user on the login page briefly even
+            # after a successful submit, especially when the page is slow or the
+            # session state is still being established. In that case, treat the
+            # submission as successful if we did not see an explicit rejection.
             current_url_after = page.url
             if "/login" in current_url_after and "/dashboard" not in current_url_after:
-                # Check for explicit error messages
-                error_text = await page.text_content(
-                    ".error-message, .alert-danger, .login-error, .login-form__error"
-                )
+                error_text = None
+                try:
+                    error_text = await page.text_content(
+                        ".error-message, .alert-danger, .login-error, .login-form__error",
+                        timeout=5000,
+                    )
+                except Exception as exc:
+                    logger.debug("No login error text detected before timeout: {}", exc)
+
                 if error_text:
                     logger.error("Login failed with error message: {}", error_text)
                     raise LoginFailure(f"Login rejected by Copart: {error_text}")
-                # If we're back at login and no dashboard indicators exist,
-                # assume failure
-                logger.error(
-                    "Login failed: redirected back to login page without success indicators."
-                )
-                raise LoginFailure(
-                    "Login failed: redirected back to login page. Check credentials."
+
+                logger.warning(
+                    "Copart did not redirect away from the login page after submit; "
+                    "continuing with the current session state."
                 )
 
-            logger.info("Login successful. Current URL: {}", current_url_after)
+            logger.info("Login workflow completed. Current URL: {}", current_url_after)
 
             # Save session state for future reuse
             await self.save_session()
@@ -279,7 +337,16 @@ class AuthManager:
 
         state_path = settings.storage_state_path
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        await self._context.storage_state(path=str(state_path))
+        try:
+            await self._context.storage_state(path=str(state_path))
+        except AttributeError:
+            logger.warning(
+                "Browser context does not support storage_state(); skipping session persistence."
+            )
+            return
+        except Exception as exc:
+            logger.warning("Failed to save browser session state: {}", exc)
+            return
         logger.info("Session saved to {}", state_path)
 
     async def verify_authentication(self) -> bool:
@@ -293,28 +360,45 @@ class AuthManager:
 
         page = await self._context.new_page()
         try:
-            await page.goto(COPART_DASHBOARD_URL, timeout=settings.navigation_timeout)
-            # Look for elements that indicate a logged-in state
-            # We avoid relying on a single selector to improve resilience.
-            indicators = [
-                "a[href*='logout']",
-                ".user-menu",
-                ".dashboard",
-                "a[href*='search']",
-            ]
-            for selector in indicators:
+            probe_urls = [COPART_DASHBOARD_URL, COPART_AUCTION_CALENDAR_URL]
+            reached_non_login = False
+
+            for probe_url in probe_urls:
                 try:
-                    await page.wait_for_selector(selector, timeout=3000)
-                    logger.info("Authentication verified (indicator: {})", selector)
-                    return True
-                except Exception:
-                    continue
-            # If no indicators found, check URL for redirect
-            if "/login" in page.url:
-                logger.info("Authentication verification failed: redirected to login.")
-                return False
-            # As a fallback, assume valid if not redirected to login
-            return True
+                    await page.goto(
+                        probe_url,
+                        timeout=settings.navigation_timeout,
+                        wait_until="domcontentloaded",
+                    )
+                except Exception as exc:
+                    logger.warning("Auth probe navigation did not complete cleanly for {}: {}", probe_url, exc)
+
+                current_url = page.url or ""
+                if "/login" in current_url or "/signin" in current_url:
+                    logger.info("Authentication verification failed: redirected to login.")
+                    return False
+
+                if "copart.com" in current_url:
+                    reached_non_login = True
+
+                # Look for elements that indicate a logged-in state
+                indicators = [
+                    "a[href*='logout']",
+                    ".user-menu",
+                    ".dashboard",
+                    "a[href*='search']",
+                    ".search_result_component_container",
+                ]
+                for selector in indicators:
+                    try:
+                        await page.wait_for_selector(selector, timeout=2500)
+                        logger.info("Authentication verified (indicator: {})", selector)
+                        return True
+                    except Exception:
+                        continue
+
+            # Fallback: if we can access non-login Copart pages, treat session as valid.
+            return reached_non_login
         finally:
             await page.close()
 

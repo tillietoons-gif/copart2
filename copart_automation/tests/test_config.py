@@ -34,6 +34,16 @@ class TestConfiguration:
         assert settings.browser_channel == "firefox"
         assert settings.retry_max_attempts == 5
 
+    def test_search_is_disabled_by_default(self) -> None:
+        """Default workflow should not navigate to search unless explicitly enabled."""
+        settings = Settings()
+        assert settings.perform_search is False
+
+    def test_search_can_be_enabled(self) -> None:
+        """Search can be enabled explicitly when needed."""
+        settings = Settings(perform_search=True)
+        assert settings.perform_search is True
+
     def test_email_and_password_handling(self) -> None:
         """Credentials should be validated but not exposed in logs."""
         settings = Settings(copart_email="test@example.com", copart_password="secret")

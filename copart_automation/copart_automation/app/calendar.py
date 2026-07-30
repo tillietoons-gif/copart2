@@ -29,6 +29,19 @@ class AuctionCalendarParser:
         """Parse the auction calendar from the given page."""
         page_url = getattr(page, "url", "unknown")
         logger.info("Parsing auction calendar from {}", page_url)
+
+        html_content = await page.content()
+        if not html_content:
+            logger.warning("Auction calendar page content was empty or did not load correctly.")
+            return []
+
+        # Give the page a brief moment to finish rendering dynamic content.
+        # Copart often loads the calendar markup asynchronously and then updates it.
+        try:
+            await page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
         html_content = await page.content()
         soup = BeautifulSoup(html_content, "lxml")
 
@@ -38,6 +51,10 @@ class AuctionCalendarParser:
             tables.extend(soup.select(selector))
             if tables:
                 break
+
+        if not tables:
+            logger.warning("No calendar tables were found in the auction calendar HTML.")
+            return []
 
         entries: list[AuctionCalendarEntry] = []
         for table_index, table in enumerate(tables, start=1):

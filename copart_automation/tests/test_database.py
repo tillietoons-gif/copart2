@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from copart_automation.app.database import DatabaseModule
-from copart_automation.app.models import SearchQuery, Vehicle
+from copart_automation.app.models import AuctionCalendarEntry, SearchQuery, Vehicle
 
 
 
@@ -84,3 +84,58 @@ class TestDatabaseOperations:
             db.insert_vehicle(vehicle)
             result_path = db.export_to_json(export_path)
             assert result_path.exists()
+
+    def test_insert_auction_calendar_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            db = DatabaseModule(db_path=db_path)
+            entry = AuctionCalendarEntry(
+                event_date="2026-07-30",
+                auction_time="10:00 AM",
+                description="Test auction",
+                table_section="table-1",
+                row_index=1,
+                column_index=1,
+                lots_view_url="https://example.com/auction/1",
+                lots_view_text="View Lots",
+            )
+            entry_id = db.insert_auction_calendar_entry(entry)
+            assert entry_id > 0
+
+    def test_insert_auction_calendar_entry_skips_normalized_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            db = DatabaseModule(db_path=db_path)
+            first = AuctionCalendarEntry(
+                event_date="2026-07-30",
+                auction_time="10:00 AM",
+                description="  Test auction  ",
+                table_section="table-1",
+                row_index=1,
+                column_index=1,
+                lots_view_url="https://example.com/auction/1",
+                lots_view_text="View Lots",
+            )
+            second = AuctionCalendarEntry(
+                event_date="2026-07-30",
+                auction_time="10:00 am",
+                description="test auction",
+                table_section="table-2",
+                row_index=2,
+                column_index=2,
+                lots_view_url="https://example.com/auction/2",
+                lots_view_text="View Lots Again",
+            )
+
+            first_id = db.insert_auction_calendar_entry(first)
+            second_id = db.insert_auction_calendar_entry(second)
+
+            assert first_id > 0
+            assert second_id == first_id
+
+            conn = db._connect()
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM auction_calendar").fetchone()[0]
+            finally:
+                conn.close()
+            assert count == 1

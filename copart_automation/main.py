@@ -75,49 +75,121 @@ async def run_automation_workflow() -> int:
                 logger.info("Auction calendar parse returned {} entries", len(calendar_entries))
                 for entry in calendar_entries:
                     db.insert_auction_calendar_entry(entry)
+                    logger.info(
+                        "Persisted auction calendar entry for {} ({})",
+                        entry.event_date,
+                        entry.description or entry.lots_view_text or "no description",
+                    )
             finally:
                 await calendar_page.close()
+
+            # Fetch auction lots for every unique auction URL from the calendar.
+            auction_urls = [
+                str(entry.lots_view_url)
+                for entry in calendar_entries
+                if entry.lots_view_url
+            ]
+            unique_auction_urls = list(dict.fromkeys(auction_urls))
+
+            if unique_auction_urls:
+                logger.info(
+                    "Starting auction lots fetch for {} auction URLs from calendar entries.",
+                    len(unique_auction_urls),
+                )
+                total_fetched = 0
+                for idx, auction_url in enumerate(unique_auction_urls, start=1):
+                    logger.info(
+                        "[{}/{}] Fetching lots from auction URL: {}",
+                        idx,
+                        len(unique_auction_urls),
+                        auction_url,
+                    )
+                    try:
+                        auction_vehicles = await search_module.fetch_auction_data_from_url(auction_url)
+                        logger.info(
+                            "[{}/{}] Fetched {} auction vehicles",
+                            idx,
+                            len(unique_auction_urls),
+                            len(auction_vehicles),
+                        )
+                        total_fetched += len(auction_vehicles)
+                        for vehicle in auction_vehicles:
+                            db.insert_vehicle(vehicle)
+                    except Exception as exc:
+                        logger.warning(
+                            "[{}/{}] Auction data extraction failed for {} (continuing): {}",
+                            idx,
+                            len(unique_auction_urls),
+                            auction_url,
+                            exc,
+                        )
+
+                logger.info(
+                    "Completed auction lots fetch. Total lots fetched across all auction URLs: {}",
+                    total_fetched,
+                )
+
+                # Attempt one CSV export from the first auction URL.
+                first_lots_url = unique_auction_urls[0]
+                logger.info("Opening first auction lots page for CSV export: {}", first_lots_url)
+                lots_page = await navigation.navigate_to_page(
+                    first_lots_url,
+                    timeout=45000,
+                    wait_until="domcontentloaded",
+                )
+                try:
+                    download_path = await search_module.click_export_button(lots_page, timeout=25000)
+                    if download_path:
+                        logger.info("Auction CSV downloaded successfully: {}", download_path)
+                    else:
+                        logger.warning("Export button click did not produce a CSV download.")
+                finally:
+                    await lots_page.close()
+            else:
+                logger.warning("No lots_view_url found in calendar data; auction lots fetch skipped.")
 
             # Example: navigate to dashboard to confirm session
             logger.info("Navigating to dashboard for confirmation...")
             page = await navigation.navigate_to_dashboard()
             await page.close()
 
-            # Example: perform a search (use safe test values or user-configured values)
-            # Note: This does not attempt to interact with bidding systems.
-            # Real searches should be configured by the user via environment
-            # or additional command-line arguments.
-            test_vin = "5GZCZ43D13S812715"  # Example VIN for demonstration only
-            logger.info("Performing example VIN search (demonstration): {}", test_vin)
-            try:
-                vehicles = await search_module.search_by_vin(test_vin)
-                logger.info("Search returned {} vehicle(s)", len(vehicles))
-                for vehicle in vehicles:
-                    logger.info(
-                        "Vehicle: {} | {} {} | Lot: {} | Bid: {}",
-                        vehicle.vin,
-                        vehicle.year,
-                        vehicle.make,
-                        vehicle.lot_number,
-                        vehicle.current_bid,
-                    )
-                    # Persist to database
-                    vehicle_id = db.insert_vehicle(vehicle)
-                    # Optionally download images (limited for demonstration)
-                    if vehicle.image_urls:
-                        logger.info("Attempting to download images for lot {}", vehicle.lot_number)
-                        try:
-                            records = await download_manager.download_vehicle_images(vehicle, max_images=2)
-                            for record in records:
-                                # Update with actual database vehicle ID
-                                if vehicle_id:
-                                    record.vehicle_id = vehicle_id
-                                db.insert_download(record)
-                            logger.info("Downloaded {} images.", len(records))
-                        except Exception as exc:
-                            logger.warning(f"Image download failed (not blocking): {exc}")
-            except Exception as exc:
-                logger.warning(f"Search or parsing error (continuing): {exc}")
+            # Optional demo search. This stays disabled by default to avoid
+            # navigating to search when the workflow is used for calendar-only
+            # collection or other non-search tasks.
+            if settings.perform_search:
+                test_vin = "5GZCZ43D13S812715"  # Example VIN for demonstration only
+                logger.info("Performing example VIN search (demonstration): {}", test_vin)
+                try:
+                    vehicles = await search_module.search_by_vin(test_vin)
+                    logger.info("Search returned {} vehicle(s)", len(vehicles))
+                    for vehicle in vehicles:
+                        logger.info(
+                            "Vehicle: {} | {} {} | Lot: {} | Bid: {}",
+                            vehicle.vin,
+                            vehicle.year,
+                            vehicle.make,
+                            vehicle.lot_number,
+                            vehicle.current_bid,
+                        )
+                        # Persist to database
+                        vehicle_id = db.insert_vehicle(vehicle)
+                        # Optionally download images (limited for demonstration)
+                        if vehicle.image_urls:
+                            logger.info("Attempting to download images for lot {}", vehicle.lot_number)
+                            try:
+                                records = await download_manager.download_vehicle_images(vehicle, max_images=2)
+                                for record in records:
+                                    # Update with actual database vehicle ID
+                                    if vehicle_id:
+                                        record.vehicle_id = vehicle_id
+                                    db.insert_download(record)
+                                logger.info("Downloaded {} images.", len(records))
+                            except Exception as exc:
+                                logger.warning(f"Image download failed (not blocking): {exc}")
+                except Exception as exc:
+                    logger.warning(f"Search or parsing error (continuing): {exc}")
+            else:
+                logger.info("Search step skipped because perform_search is disabled.")
 
             # Example: export existing database to CSV
             try:
